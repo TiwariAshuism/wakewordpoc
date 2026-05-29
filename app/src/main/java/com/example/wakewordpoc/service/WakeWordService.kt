@@ -1,6 +1,7 @@
 package com.example.wakewordpoc.service
 
 import ai.picovoice.porcupine.PorcupineManager
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -8,6 +9,8 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.Handler
@@ -15,6 +18,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.example.wakewordpoc.MainActivity
 import com.example.wakewordpoc.R
 import com.example.wakewordpoc.WakeWordConfig
@@ -60,7 +64,17 @@ class WakeWordService : Service() {
     }
 
     private fun startListening() {
-        startForeground(NOTIFICATION_ID, buildNotification("Listening for Hey M"))
+        if (!hasMicrophonePermission()) {
+            WakeWordConfig.setError(this, "Microphone permission is missing")
+            stopSelf()
+            return
+        }
+
+        if (!startAsMicrophoneForeground("Listening for Hey M")) {
+            stopSelf()
+            return
+        }
+
         WakeWordConfig.setServiceState(this, running = true, engineActive = false)
 
         if (recording || porcupineManager != null) return
@@ -99,6 +113,12 @@ class WakeWordService : Service() {
     }
 
     private fun startTwoMinuteRecording() {
+        if (!hasMicrophonePermission()) {
+            WakeWordConfig.setRecording(this, false)
+            WakeWordConfig.setError(this, "Recording blocked: microphone permission is missing")
+            return
+        }
+
         val output = nextOutputFile()
         val newRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             MediaRecorder(this)
@@ -133,6 +153,29 @@ class WakeWordService : Service() {
             WakeWordConfig.setError(this, "Recording failed: ${it.message}")
             startListening()
         }
+    }
+
+    private fun hasMicrophonePermission(): Boolean =
+        ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.RECORD_AUDIO,
+        ) == PackageManager.PERMISSION_GRANTED
+
+    private fun startAsMicrophoneForeground(text: String): Boolean {
+        val notification = buildNotification(text)
+        return runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        }.onFailure {
+            WakeWordConfig.setError(this, "Foreground microphone start failed: ${it.message}")
+        }.isSuccess
     }
 
     private fun stopRecordingAndResume() {

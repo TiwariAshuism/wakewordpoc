@@ -6,7 +6,8 @@ This Android app is wired as a tablet-first proof of concept:
 - Porcupine custom wake word listener.
 - Boot receiver for restart after reboot/package update.
 - Screen wake and activity launch when the wake word fires.
-- Two-minute AAC recording saved in the app's external files directory.
+- Two-minute AAC recording saved directly with `MediaRecorder` in the app's
+  external files directory.
 - Manual `Simulate Wake` control to test the recording/screen flow before the model is ready.
 - Optional root buttons for stay-awake behavior on a controlled tablet.
 
@@ -36,14 +37,33 @@ Then on the tablet:
 
 - Grant microphone and notification permissions.
 - Open `Battery Settings` from the app and allow unrestricted/background behavior.
-- Set `Hey M` as the default home app if you want kiosk-like foreground behavior.
-- Keep the tablet plugged in.
+- Open `Home Settings` from the app and set `Hey M` as the default home app.
+- Use a dedicated tablet, keep it plugged in, and keep it on power during testing.
+- Use the `Root` controls, Android developer settings, or device-owner policy to make
+  the tablet never sleep.
+- On Android 14+, boot can post an `Arm Hey M` notification instead of directly starting
+  the microphone listener. Opening the app arms the service; if `Hey M` is the default
+  home app, this happens naturally when the tablet reaches home after boot/unlock.
+
+## Recording Backend
+
+This PoC currently uses `MediaRecorder` because it saves directly to `.m4a` and keeps
+the first prototype simple. `AudioRecord` is the right next step if you want raw PCM,
+streaming chunks, custom silence detection, waveform analysis, or local speech models.
 
 If the tablet is rooted, the in-app `Root` controls run:
 
 ```text
 settings put global stay_on_while_plugged_in 3
 svc power stayon true
+```
+
+For stricter lab devices, you can also run rooted ADB commands such as:
+
+```powershell
+adb shell su -c "dumpsys deviceidle disable"
+adb shell su -c "cmd appops set com.example.wakewordpoc RUN_ANY_IN_BACKGROUND allow"
+adb shell su -c "cmd appops set com.example.wakewordpoc WAKE_LOCK allow"
 ```
 
 ## Test Flow

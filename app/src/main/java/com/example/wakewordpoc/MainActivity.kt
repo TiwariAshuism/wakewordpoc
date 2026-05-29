@@ -138,6 +138,13 @@ private fun HeyMScreen() {
     }
 
     LaunchedEffect(Unit) {
+        if (WakeWordConfig.autoStart(context) &&
+            hasRuntimePermissions(context) &&
+            !WakeWordConfig.snapshot(context).serviceRunning
+        ) {
+            startWakeService(context)
+        }
+
         while (true) {
             status = WakeWordConfig.snapshot(context)
             delay(1000L)
@@ -245,6 +252,9 @@ private fun HeyMScreen() {
                 Spacer(Modifier.height(8.dp))
                 TextButton(onClick = { openBatterySettings(context) }) {
                     Text("Battery Settings")
+                }
+                TextButton(onClick = { openHomeSettings(context) }) {
+                    Text("Home Settings")
                 }
             }
 
@@ -379,6 +389,14 @@ private fun openBatterySettings(context: Context) {
                 data = Uri.parse("package:${context.packageName}")
             })
         }
+}
+
+private fun openHomeSettings(context: Context) {
+    runCatching {
+        context.startActivity(Intent(Settings.ACTION_HOME_SETTINGS))
+    }.onFailure {
+        context.startActivity(Intent(Settings.ACTION_SETTINGS))
+    }
 }
 
 private fun runRootCommand(context: Context, command: String) {
