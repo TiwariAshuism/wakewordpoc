@@ -1,6 +1,5 @@
 package com.example.wakewordpoc.service
 
-import ai.picovoice.porcupine.PorcupineManager
 import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
@@ -17,11 +16,13 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.speech.tts.TextToSpeech
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.example.wakewordpoc.MainActivity
 import com.example.wakewordpoc.R
 import com.example.wakewordpoc.WakeWordConfig
+import com.example.wakewordpoc.ml.TFLiteWakeWordDetector
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -29,16 +30,27 @@ import java.util.Locale
 
 class WakeWordService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var porcupineManager: PorcupineManager? = null
+    private var wakeWordDetector: TFLiteWakeWordDetector? = null
     private var recorder: MediaRecorder? = null
     private var currentOutput: File? = null
     private var recording = false
+    private var textToSpeech: TextToSpeech? = null
+    private var ttsReady = false
 
     private val stopRecordingRunnable = Runnable { stopRecordingAndResume() }
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        wakeWordDetector = TFLiteWakeWordDetector(this) { confidence ->
+            onWakeWordDetected(confidence)
+        }
+        textToSpeech = TextToSpeech(this) { result ->
+            ttsReady = result == TextToSpeech.SUCCESS
+            if (ttsReady) {
+                textToSpeech?.language = Locale.US
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -49,7 +61,11 @@ class WakeWordService : Service() {
                 return START_NOT_STICKY
             }
 
-            ACTION_SIMULATE_DETECTION -> onWakeWordDetected()
+            ACTION_STOP_RECORDING -> {
+                if (recording) stopRecordingAndResume()
+            }
+
+            ACTION_SIMULATE_DETECTION -> onWakeWordDetected(1f)
             else -> startListening()
         }
 
@@ -64,51 +80,47 @@ class WakeWordService : Service() {
     }
 
     private fun startListening() {
+        WakeWordConfig.setMlStatus(this, "Service start requested")
         if (!hasMicrophonePermission()) {
             WakeWordConfig.setError(this, "Microphone permission is missing")
+            WakeWordConfig.setMlStatus(this, "Missing microphone permission")
             stopSelf()
             return
         }
 
         if (!startAsMicrophoneForeground("Listening for Hey M")) {
+            WakeWordConfig.setMlStatus(this, "Foreground microphone start failed")
             stopSelf()
             return
         }
 
         WakeWordConfig.setServiceState(this, running = true, engineActive = false)
 
-        if (recording || porcupineManager != null) return
-
-        val accessKey = WakeWordConfig.accessKey(this)
-        if (accessKey.isBlank()) {
-            WakeWordConfig.setError(this, "Picovoice AccessKey is missing")
-            updateNotification("Service ready, AccessKey missing")
-            return
-        }
+        if (recording) return
 
         runCatching {
-            val keywordPath = WakeWordConfig.keywordPath(this)
-            porcupineManager = PorcupineManager.Builder()
-                .setAccessKey(accessKey)
-                .setKeywordPaths(arrayOf(keywordPath))
-                .build(applicationContext) { onWakeWordDetected() }
-            porcupineManager?.start()
+            wakeWordDetector?.startListening()
             WakeWordConfig.setServiceState(this, running = true, engineActive = true)
+            WakeWordConfig.setMlStatus(this, "Wake detector active")
             updateNotification("Listening for Hey M")
         }.onFailure {
             WakeWordConfig.setServiceState(this, running = true, engineActive = false)
-            WakeWordConfig.setError(this, "Porcupine failed: ${it.message}")
+            WakeWordConfig.setError(this, "TFLite failed: ${it.message}")
+            WakeWordConfig.setMlStatus(this, "TFLite failed: ${it.message}")
             updateNotification("Wake engine inactive")
         }
     }
 
-    private fun onWakeWordDetected() {
+    private fun onWakeWordDetected(confidence: Float) {
         if (recording) return
 
-        WakeWordConfig.markDetection(this)
+        WakeWordConfig.markDetection(this, confidence)
+        showDetectionNotification(confidence)
+        speakGreeting()
         wakeScreen()
         openControlScreen()
-        stopPorcupine()
+        wakeWordDetector?.stopListening()
+        WakeWordConfig.setServiceState(this, running = true, engineActive = false)
         startTwoMinuteRecording()
     }
 
@@ -153,6 +165,16 @@ class WakeWordService : Service() {
             WakeWordConfig.setError(this, "Recording failed: ${it.message}")
             startListening()
         }
+    }
+
+    private fun speakGreeting() {
+        if (!ttsReady) return
+        textToSpeech?.speak(
+            "Good morning. I am listening.",
+            TextToSpeech.QUEUE_FLUSH,
+            null,
+            "hey_m_greeting",
+        )
     }
 
     private fun hasMicrophonePermission(): Boolean =
@@ -202,17 +224,15 @@ class WakeWordService : Service() {
         recorder = null
         currentOutput = null
         recording = false
-        stopPorcupine()
+        wakeWordDetector?.release()
+        wakeWordDetector = null
+        textToSpeech?.stop()
+        textToSpeech?.shutdown()
+        textToSpeech = null
+        ttsReady = false
         WakeWordConfig.setRecording(this, false)
         WakeWordConfig.setServiceState(this, running = false, engineActive = false)
         stopForeground(STOP_FOREGROUND_REMOVE)
-    }
-
-    private fun stopPorcupine() {
-        porcupineManager?.stopIgnoringErrors()
-        porcupineManager?.deleteIgnoringErrors()
-        porcupineManager = null
-        WakeWordConfig.setServiceState(this, running = true, engineActive = false)
     }
 
     private fun nextOutputFile(): File {
@@ -275,6 +295,29 @@ class WakeWordService : Service() {
             .build()
     }
 
+    private fun showDetectionNotification(confidence: Float) {
+        val openIntent = PendingIntent.getActivity(
+            this,
+            3,
+            Intent(this, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                .putExtra(MainActivity.EXTRA_WAKE_EVENT, true),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val percent = (confidence * 100f).toInt().coerceIn(0, 100)
+        val notification = NotificationCompat.Builder(this, DETECTION_CHANNEL_ID)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("Hey M detected")
+            .setContentText("Confidence $percent%. Recording started.")
+            .setContentIntent(openIntent)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .build()
+
+        getSystemService(NotificationManager::class.java)
+            .notify(DETECTION_NOTIFICATION_ID, notification)
+    }
+
     private fun updateNotification(text: String) {
         getSystemService(NotificationManager::class.java)
             .notify(NOTIFICATION_ID, buildNotification(text))
@@ -291,6 +334,15 @@ class WakeWordService : Service() {
             description = "Persistent wake word listener"
         }
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+
+        val detectionChannel = NotificationChannel(
+            DETECTION_CHANNEL_ID,
+            "Hey M detections",
+            NotificationManager.IMPORTANCE_HIGH,
+        ).apply {
+            description = "Wake word detection alerts"
+        }
+        getSystemService(NotificationManager::class.java).createNotificationChannel(detectionChannel)
     }
 
     private fun MediaRecorder.stopIgnoringErrors() {
@@ -301,20 +353,15 @@ class WakeWordService : Service() {
         runCatching { release() }
     }
 
-    private fun PorcupineManager.stopIgnoringErrors() {
-        runCatching { stop() }
-    }
-
-    private fun PorcupineManager.deleteIgnoringErrors() {
-        runCatching { delete() }
-    }
-
     companion object {
         const val ACTION_START = "com.example.wakewordpoc.action.START"
         const val ACTION_STOP = "com.example.wakewordpoc.action.STOP"
+        const val ACTION_STOP_RECORDING = "com.example.wakewordpoc.action.STOP_RECORDING"
         const val ACTION_SIMULATE_DETECTION = "com.example.wakewordpoc.action.SIMULATE_DETECTION"
 
         private const val CHANNEL_ID = "wake_word_listener"
+        private const val DETECTION_CHANNEL_ID = "wake_word_detections"
         private const val NOTIFICATION_ID = 42
+        private const val DETECTION_NOTIFICATION_ID = 44
     }
 }

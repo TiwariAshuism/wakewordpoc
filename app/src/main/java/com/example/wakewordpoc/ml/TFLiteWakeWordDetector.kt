@@ -1,427 +1,489 @@
 package com.example.wakewordpoc.ml
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
+import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
-import android.Manifest
-import android.content.pm.PackageManager
-import androidx.core.content.ContextCompat
-import org.tensorflow.lite.Interpreter
+import android.os.Process
 import android.util.Log
+import androidx.core.content.ContextCompat
+import com.example.wakewordpoc.WakeWordConfig
+import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.Tensor
+import java.io.FileInputStream
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
-import java.io.FileInputStream
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.PI
+import kotlin.math.cos
 import kotlin.math.log10
-import kotlin.math.sqrt
+import kotlin.math.max
+import kotlin.math.pow
+import kotlin.math.round
+import kotlin.math.sin
 
-/**
- * TFLite-based Wake Word Detector
- * 
- * CRITICAL DATA FLOW:
- * 1. AudioRecord captures PCM 16-bit at 16kHz
- * 2. Convert SHORT audio → FLOAT32 (-1.0 to 1.0)
- * 3. Extract MEL-SPECTROGRAM: 40 bins × 64 time steps
- * 4. Input to TFLite model: shape [1, 40, 64], type FLOAT32
- * 5. Output: probability [0.0, 1.0]
- */
-class TFLiteWakeWordDetector(private val context: Context) {
-    
-    companion object {
-        private const val TAG = "TFLiteWakeWord"
-        
-        // ✓ MUST match training configuration
-        private const val SAMPLE_RATE = 16000         // 16kHz (NOT 44.1kHz!)
-        private const val DURATION_SECONDS = 1        // 1 second window
-        private const val AUDIO_CHUNK_SIZE = 16000    // 16000 samples = 1 second @ 16kHz
-        
-        // Mel-spectrogram configuration
-        private const val MEL_BINS = 40               // 40 mel frequency bins
-        private const val N_FFT = 512                 // FFT window size
-        private const val HOP_LENGTH = 160            // 160ms overlap (80ms stride)
-        private const val TIME_STEPS = 64             // Number of frames per window
-        
-        // Model configuration
-        private const val MODEL_FILE = "model_student_int8.tflite"
-        private const val DETECTION_THRESHOLD = 0.5f  // 50% confidence threshold
-    }
-    
-    private var interpreter: Interpreter? = null
+class TFLiteWakeWordDetector(
+    private val context: Context,
+    private val onDetected: (Float) -> Unit,
+) {
+    private var stage1: ModelRunner? = null
+    private var stage2: ModelRunner? = null
     private var audioRecord: AudioRecord? = null
-    private var isListening = false
-    private var streamingBuffer = FloatArray(AUDIO_CHUNK_SIZE)
-    private var bufferIndex = 0
-    
-    // TFLite input/output buffers
-    private var modelInput: Array<Array<FloatArray>>? = null  // [1, 40, 64]
-    private var modelOutput: MutableMap<Int, Any>? = null      // [1, 1] probability
-    
-    private var melProcessor: MelSpectrogramProcessor? = null
-    
-    init {
-        Log.d(TAG, "🔄 Initializing TFLite Wake Word Detector...")
-        initializeModel()
-        melProcessor = MelSpectrogramProcessor(SAMPLE_RATE, MEL_BINS, N_FFT, HOP_LENGTH, TIME_STEPS)
-    }
-    
-    // ────────────────────────────────────────────────────────────────
-    // ✅ MODEL LOADING & VALIDATION
-    // ────────────────────────────────────────────────────────────────
-    
-    private fun initializeModel() {
-        try {
-            Log.d(TAG, "📦 Loading TFLite model: $MODEL_FILE")
-            
-            // Load model from assets
-            val modelBuffer = loadModelFile(MODEL_FILE)
-            
-            // Create interpreter with multiple threads
-            val options = Interpreter.Options()
-            options.setNumThreads(4)  // Use 4 threads for faster inference
-            options.setUseNNAPI(true) // Use NNAPI accelerator if available
-            
-            interpreter = Interpreter(modelBuffer, options)
-            
-            Log.d(TAG, "✓ Model loaded successfully")
-            setupInputOutputBuffers()
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ FAILED to load model: ${e.message}", e)
-        }
-    }
-    
-    private fun loadModelFile(fileName: String): MappedByteBuffer {
-        val inputStream = context.assets.open(fileName)
-        val fileChannel = (inputStream as FileInputStream).channel
-        val startOffset = 0L
-        val declaredLength = inputStream.available().toLong()
-        return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
-    }
-    
-    private fun setupInputOutputBuffers() {
-        try {
-            val inputTensor = interpreter?.getInputTensor(0)
-            val inputShape = inputTensor?.shape()
-            
-            Log.d(TAG, "✓ Input Tensor Shape: ${inputShape?.joinToString()}")
-            Log.d(TAG, "  Expected: [1, 40, 64]")
-            Log.d(TAG, "  Type: ${inputTensor?.dataType()}")
-            
-            // Validate input shape: should be [1, 40, 64]
-            if (inputShape?.get(1) != MEL_BINS || inputShape?.get(2) != TIME_STEPS) {
-                Log.w(TAG, "⚠️ Input shape mismatch! Expected [1, 40, 64], got [${inputShape?.get(0)}, ${inputShape?.get(1)}, ${inputShape?.get(2)}]")
-            }
-            
-            // Prepare output buffers
-            modelOutput = mutableMapOf()
-            modelOutput!![0] = FloatArray(1)  // KWS probability output
-            
-            val outputTensor = interpreter?.getOutputTensor(0)
-            val outputShape = outputTensor?.shape()
-            Log.d(TAG, "✓ Output Tensor Shape: ${outputShape?.joinToString()}")
-            Log.d(TAG, "  Expected: [1, 1] for probability")
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Failed to setup buffers: ${e.message}", e)
-        }
-    }
-    
-    // ────────────────────────────────────────────────────────────────
-    // ✅ AUDIO CAPTURE (16kHz PCM, NOT 44.1kHz AAC!)
-    // ────────────────────────────────────────────────────────────────
-    
+    private var worker: Thread? = null
+    private val listening = AtomicBoolean(false)
+    private var lastDetectionMs = 0L
+    private var audioWindows = 0
+
     fun startListening() {
+        if (listening.get()) return
         if (!hasAudioPermission()) {
-            Log.e(TAG, "❌ Audio permission not granted")
-            return
+            throw IllegalStateException("Microphone permission is missing")
         }
-        
-        try {
-            isListening = true
-            initAudioRecord()
-            audioRecord?.startRecording()
-            
-            // Start processing in background thread
-            Thread { processAudioStream() }.start()
-            
-            Log.d(TAG, "✓ Listening started (16kHz PCM)")
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Failed to start listening: ${e.message}", e)
-        }
-    }
-    
-    private fun initAudioRecord() {
-        val minBufferSize = AudioRecord.getMinBufferSize(
-            SAMPLE_RATE,                                    // ✓ 16kHz (was 44100!)
-            android.media.AudioFormat.CHANNEL_IN_MONO,
-            android.media.AudioFormat.ENCODING_PCM_16BIT    // ✓ PCM 16-bit (was AAC!)
+
+        ensureModels()
+        WakeWordConfig.setMlStatus(context, "Starting AudioRecord")
+        val minBuffer = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
         )
-        
+        require(minBuffer > 0) { "AudioRecord buffer is unavailable: $minBuffer" }
+
         audioRecord = AudioRecord(
-            MediaRecorder.AudioSource.MIC,
-            SAMPLE_RATE,                                    // ✓ 16kHz
-            android.media.AudioFormat.CHANNEL_IN_MONO,
-            android.media.AudioFormat.ENCODING_PCM_16BIT,   // ✓ PCM 16-bit
-            minBufferSize * 2
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            max(minBuffer * 2, READ_SAMPLES * 2),
         )
-        
-        Log.d(TAG, "✓ AudioRecord initialized:")
-        Log.d(TAG, "   Sample Rate: $SAMPLE_RATE Hz")
-        Log.d(TAG, "   Buffer Size: ${minBufferSize * 2} bytes")
+        audioRecord?.startRecording()
+        Log.i(TAG, "AudioRecord started sampleRate=$SAMPLE_RATE minBuffer=$minBuffer")
+        WakeWordConfig.setMlStatus(context, "Listening: mic active")
+        listening.set(true)
+        worker = Thread(::processLoop, "HeyM-TFLite-Cascade").apply { start() }
     }
-    
-    // ────────────────────────────────────────────────────────────────
-    // ✅ AUDIO PROCESSING PIPELINE
-    // ────────────────────────────────────────────────────────────────
-    
-    private fun processAudioStream() {
-        val frameSize = SAMPLE_RATE / 10  // 100ms frames @ 16kHz = 1600 samples
-        val buffer = ShortArray(frameSize)
-        
-        Log.d(TAG, "🎙️ Audio stream processing started")
-        Log.d(TAG, "   Frame size: $frameSize samples (100ms)")
-        
-        while (isListening) {
-            try {
-                // Read audio from microphone
-                val samplesRead = audioRecord?.read(buffer, 0, buffer.size) ?: 0
-                
-                if (samplesRead > 0) {
-                    // Add to circular buffer
-                    addToStreamingBuffer(buffer, samplesRead)
-                    
-                    // When we have 1 second of audio, run inference
-                    if (bufferIndex >= AUDIO_CHUNK_SIZE) {
-                        runInference()
-                        // Shift buffer by half for sliding window
-                        shiftBuffer()
-                    }
-                }
-                
-            } catch (e: Exception) {
-                Log.e(TAG, "❌ Audio processing error: ${e.message}")
-            }
-        }
-    }
-    
-    private fun addToStreamingBuffer(samples: ShortArray, numSamples: Int) {
-        for (i in 0 until numSamples) {
-            if (bufferIndex < AUDIO_CHUNK_SIZE) {
-                // Convert SHORT (-32768 to 32767) → FLOAT32 (-1.0 to 1.0)
-                streamingBuffer[bufferIndex] = samples[i] / 32768f
-                bufferIndex++
-            }
-        }
-    }
-    
-    private fun shiftBuffer() {
-        // Sliding window: move half the buffer to the start
-        val halfSize = AUDIO_CHUNK_SIZE / 2
-        for (i in 0 until halfSize) {
-            streamingBuffer[i] = streamingBuffer[i + halfSize]
-        }
-        bufferIndex = halfSize
-    }
-    
-    // ────────────────────────────────────────────────────────────────
-    // ✅ INFERENCE & DETECTION
-    // ────────────────────────────────────────────────────────────────
-    
-    private fun runInference() {
-        try {
-            // Step 1: Extract MEL-SPECTROGRAM from audio
-            // Input: 16,000 float samples (1 second @ 16kHz)
-            // Output: [1, 40, 64] MEL-SPECTROGRAM
-            val melSpec = melProcessor?.extractMelSpectrogram(streamingBuffer)
-            
-            if (melSpec == null) {
-                Log.w(TAG, "⚠️ Failed to extract MEL-spectrogram")
-                return
-            }
-            
-            Log.d(TAG, "✓ MEL-Spectrogram extracted: shape [1, 40, 64]")
-            
-            // Step 2: Prepare input for TFLite model
-            modelInput = melSpec
-            
-            // Step 3: Run inference
-            val startTime = System.currentTimeMillis()
-            interpreter?.runForMultipleInputsOutputs(arrayOf(melSpec), modelOutput)
-            val inferenceTime = System.currentTimeMillis() - startTime
-            
-            // Step 4: Get results
-            val output = modelOutput?.get(0) as? FloatArray
-            val probability = output?.get(0) ?: 0f
-            
-            Log.d(TAG, "⚡ Inference completed in ${inferenceTime}ms")
-            Log.d(TAG, "   Probability: ${"%.3f".format(probability)} (threshold: $DETECTION_THRESHOLD)")
-            
-            // Step 5: Check detection
-            if (probability > DETECTION_THRESHOLD) {
-                onWakeWordDetected(probability)
-            }
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ Inference error: ${e.message}", e)
-        }
-    }
-    
-    private fun onWakeWordDetected(probability: Float) {
-        Log.i(TAG, "🎤 ✅ WAKE WORD DETECTED!")
-        Log.i(TAG, "   Confidence: ${"%.1f".format(probability * 100)}%")
-        // TODO: Trigger wake action (screen, recording, etc.)
-    }
-    
+
     fun stopListening() {
-        isListening = false
-        audioRecord?.stop()
+        listening.set(false)
+        worker?.interrupt()
+        worker = null
+        audioRecord?.runCatchingStop()
         audioRecord?.release()
         audioRecord = null
-        Log.d(TAG, "✓ Listening stopped")
     }
-    
+
     fun release() {
         stopListening()
-        interpreter?.close()
-        interpreter = null
-        Log.d(TAG, "✓ Resources released")
+        stage1?.close()
+        stage2?.close()
+        stage1 = null
+        stage2 = null
     }
-    
-    private fun hasAudioPermission(): Boolean {
-        return ContextCompat.checkSelfPermission(
-            context,
-            Manifest.permission.RECORD_AUDIO
-        ) == PackageManager.PERMISSION_GRANTED
-    }
-}
 
-// ────────────────────────────────────────────────────────────────
-// ✅ MEL-SPECTROGRAM EXTRACTION
-// ────────────────────────────────────────────────────────────────
+    private fun processLoop() {
+        Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
+        val readBuffer = ShortArray(READ_SAMPLES)
+        val window = FloatArray(WINDOW_SAMPLES)
+        var writeIndex = 0
+        var collected = 0
+        var samplesSinceInference = 0
+        var totalSamples = 0L
 
-class MelSpectrogramProcessor(
-    private val sampleRate: Int,
-    private val melBins: Int,
-    private val nFft: Int,
-    private val hopLength: Int,
-    private val timeSteps: Int
-) {
-    companion object {
-        private const val TAG = "MelProcessor"
-    }
-    
-    /**
-     * Extract MEL-SPECTROGRAM from audio
-     * 
-     * INPUT: 16,000 float samples (1 second @ 16kHz)
-     * OUTPUT: [1, 40, 64] MEL-SPECTROGRAM in dB scale
-     */
-    fun extractMelSpectrogram(audioSamples: FloatArray): Array<Array<FloatArray>>? {
-        try {
-            // 1. Apply Hann window to audio
-            val windowed = applyHannWindow(audioSamples)
-            
-            // 2. Compute STFT (Short-Time Fourier Transform)
-            val stft = computeStft(windowed)
-            
-            // 3. Convert to MEL scale
-            val mel = stftToMel(stft)
-            
-            // 4. Convert to dB scale
-            val melDb = powerToDb(mel)
-            
-            // 5. Normalize to [-80, 0] range for model
-            val normalized = normalizeToModel(melDb)
-            
-            Log.d(TAG, "✓ MEL-Spectrogram extracted: [1, $melBins, $timeSteps]")
-            
-            // Return as [1, 40, 64] for TFLite
-            return arrayOf(normalized)
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "❌ MEL extraction failed: ${e.message}", e)
-            return null
-        }
-    }
-    
-    private fun applyHannWindow(samples: FloatArray): FloatArray {
-        val windowed = FloatArray(samples.size)
-        for (i in samples.indices) {
-            val hannValue = 0.5f * (1 - kotlin.math.cos(2.0 * Math.PI * i / (samples.size - 1))).toFloat()
-            windowed[i] = samples[i] * hannValue
-        }
-        return windowed
-    }
-    
-    private fun computeStft(samples: FloatArray): Array<FloatArray> {
-        // Simplified STFT: compute power spectrum for each frame
-        val numFrames = (samples.size - nFft) / hopLength + 1
-        val stft = Array(numFrames) { FloatArray(nFft / 2) }
-        
-        for (frame in 0 until numFrames) {
-            val start = frame * hopLength
-            val end = minOf(start + nFft, samples.size)
-            val frameSamples = samples.slice(start until end).toFloatArray()
-            
-            // Compute power spectrum magnitude
-            val power = computePowerSpectrum(frameSamples)
-            stft[frame] = power
-        }
-        
-        return stft
-    }
-    
-    private fun computePowerSpectrum(frame: FloatArray): FloatArray {
-        // Simple power computation (in production, use proper FFT library like KissFFT)
-        val bins = frame.size / 2
-        val power = FloatArray(bins)
-        
-        for (i in 0 until bins) {
-            var mag = 0f
-            for (j in frame.indices) {
-                mag += frame[j] * frame[j]
+        while (listening.get()) {
+            val read = audioRecord?.read(readBuffer, 0, readBuffer.size) ?: break
+            if (read <= 0) {
+                Log.w(TAG, "AudioRecord read=$read")
+                WakeWordConfig.setMlStatus(context, "Mic read issue: $read")
+                continue
             }
-            power[i] = sqrt(mag / frame.size)
-        }
-        
-        return power
-    }
-    
-    private fun stftToMel(stft: Array<FloatArray>): Array<FloatArray> {
-        // Convert linear frequency to MEL scale
-        val melSpec = Array(stft.size) { FloatArray(melBins) }
-        
-        for (frame in stft.indices) {
-            for (mel in 0 until melBins) {
-                var sum = 0f
-                for (k in stft[frame].indices) {
-                    sum += stft[frame][k]
+
+            for (i in 0 until read) {
+                window[writeIndex] = readBuffer[i] / 32768f
+                writeIndex = (writeIndex + 1) % WINDOW_SAMPLES
+            }
+            collected = minOf(WINDOW_SAMPLES, collected + read)
+            samplesSinceInference += read
+            totalSamples += read
+            if (totalSamples % (SAMPLE_RATE * 2L) == 0L) {
+                val msg = "Mic reading ${totalSamples / SAMPLE_RATE}s"
+                Log.i(TAG, msg)
+                WakeWordConfig.setMlStatus(context, msg, audioWindows = audioWindows)
+            }
+
+            if (collected == WINDOW_SAMPLES && samplesSinceInference >= INFERENCE_STRIDE_SAMPLES) {
+                samplesSinceInference = 0
+                audioWindows += 1
+                val ordered = FloatArray(WINDOW_SAMPLES)
+                for (i in ordered.indices) {
+                    ordered[i] = window[(writeIndex + i) % WINDOW_SAMPLES]
                 }
-                melSpec[frame][mel] = sum / stft[frame].size
+                runCatching { runCascade(ordered) }
+                    .onFailure { Log.e(TAG, "Cascade inference failed", it) }
             }
         }
-        
-        return melSpec
     }
-    
-    private fun powerToDb(mel: Array<FloatArray>): Array<FloatArray> {
-        return mel.map { frame ->
-            frame.map { value ->
-                10f * log10((value + 1e-9f).toDouble()).toFloat()
-            }.toFloatArray()
-        }.toTypedArray()
+
+    private fun runCascade(audio: FloatArray) {
+        val mel = MelFeatureExtractor.extract(audio)
+        val s1 = requireNotNull(stage1).score(mel)
+        if (s1 < STAGE1_THRESHOLD) {
+            val msg = "Window $audioWindows Stage1 rejected ${"%.3f".format(s1)} < $STAGE1_THRESHOLD"
+            Log.i(TAG, msg)
+            WakeWordConfig.setMlStatus(
+                context,
+                msg,
+                stage1Score = s1,
+                audioWindows = audioWindows,
+            )
+            return
+        }
+
+        val s2 = requireNotNull(stage2).score(mel)
+        val scoreMsg = "Window $audioWindows Stage1 ${"%.3f".format(s1)} Stage2 ${"%.3f".format(s2)}"
+        Log.i(TAG, scoreMsg)
+        WakeWordConfig.setMlStatus(
+            context,
+            scoreMsg,
+            stage1Score = s1,
+            stage2Score = s2,
+            audioWindows = audioWindows,
+        )
+
+        val now = System.currentTimeMillis()
+        val passesStage2 = s2 >= STAGE2_THRESHOLD
+        val passesDebugStage1 = DEBUG_TRIGGER_FROM_STAGE1 && s1 >= DEBUG_STAGE1_TRIGGER_THRESHOLD
+        if ((passesStage2 || passesDebugStage1) && now - lastDetectionMs > DETECTION_COOLDOWN_MS) {
+            lastDetectionMs = now
+            val confidence = if (passesStage2) s2 else s1
+            val source = if (passesStage2) "stage2" else "stage1-debug"
+            Log.i(TAG, "DETECTED Hey M source=$source confidence=${"%.3f".format(confidence)}")
+            WakeWordConfig.setMlStatus(
+                context,
+                "DETECTED $source ${"%.3f".format(confidence)}",
+                stage1Score = s1,
+                stage2Score = s2,
+                audioWindows = audioWindows,
+            )
+            onDetected(confidence)
+        } else if (s2 < STAGE2_THRESHOLD) {
+            Log.i(TAG, "Stage2 rejected ${"%.3f".format(s2)} < $STAGE2_THRESHOLD")
+        } else {
+            Log.i(TAG, "Detection ignored during cooldown")
+        }
     }
-    
-    private fun normalizeToModel(melDb: Array<FloatArray>): Array<FloatArray> {
-        // Reshape to [40, 64] and normalize to [-80, 0] range
-        val normalized = Array(melBins) { FloatArray(timeSteps) }
-        
-        for (i in 0 until minOf(melDb.size, timeSteps)) {
-            for (j in 0 until minOf(melDb[i].size, melBins)) {
-                val value = melDb[i][j].coerceIn(-80f, 0f)
-                normalized[j][i] = value
+
+    private fun ensureModels() {
+        if (stage1 != null && stage2 != null) return
+        stage1 = ModelRunner(context, WakeWordConfig.STAGE1_MODEL_ASSET)
+        stage2 = ModelRunner(context, WakeWordConfig.STAGE2_MODEL_ASSET)
+        WakeWordConfig.setMlStatus(context, "Models loaded")
+    }
+
+    private fun hasAudioPermission(): Boolean =
+        ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO,
+        ) == PackageManager.PERMISSION_GRANTED
+
+    private fun AudioRecord.runCatchingStop() {
+        runCatching { stop() }
+    }
+
+    private class ModelRunner(
+        private val context: Context,
+        private val assetName: String,
+    ) {
+        private val interpreter: Interpreter
+        private val inputType: TensorType
+        private val outputType: TensorType
+        private val inputScale: Float
+        private val inputZeroPoint: Int
+        private val outputScale: Float
+        private val outputZeroPoint: Int
+
+        init {
+            interpreter = Interpreter(
+                loadModel(assetName),
+                Interpreter.Options().apply {
+                    setNumThreads(2)
+                    setUseXNNPACK(true)
+                },
+            )
+            val input = interpreter.getInputTensor(0)
+            val output = interpreter.getOutputTensor(0)
+            validateInputShape(input, assetName)
+            inputType = TensorType.from(input.dataType().name)
+            outputType = TensorType.from(output.dataType().name)
+            input.quantizationParams().let {
+                inputScale = it.scale
+                inputZeroPoint = it.zeroPoint
+            }
+            output.quantizationParams().let {
+                outputScale = it.scale
+                outputZeroPoint = it.zeroPoint
+            }
+            Log.i(TAG, "Loaded $assetName input=${input.dataType()} output=${output.dataType()}")
+        }
+
+        fun score(mel: Array<Array<Array<FloatArray>>>): Float {
+            return when (inputType) {
+                TensorType.FLOAT32 -> scoreFloat(mel)
+                TensorType.INT8 -> scoreInt8(mel)
             }
         }
-        
-        return normalized
+
+        fun close() {
+            interpreter.close()
+        }
+
+        private fun scoreFloat(mel: Array<Array<Array<FloatArray>>>): Float {
+            val output = when (outputType) {
+                TensorType.FLOAT32 -> Array(1) { FloatArray(1) }
+                TensorType.INT8 -> Array(1) { ByteArray(1) }
+            }
+            interpreter.run(mel, output)
+            return readOutput(output)
+        }
+
+        private fun scoreInt8(mel: Array<Array<Array<FloatArray>>>): Float {
+            val output = when (outputType) {
+                TensorType.FLOAT32 -> Array(1) { FloatArray(1) }
+                TensorType.INT8 -> Array(1) { ByteArray(1) }
+            }
+            interpreter.run(quantizeMel(mel), output)
+            return readOutput(output)
+        }
+
+        private fun readOutput(output: Any): Float {
+            return when (outputType) {
+                TensorType.FLOAT32 -> (output as Array<FloatArray>)[0][0]
+                TensorType.INT8 -> {
+                    val raw = (output as Array<ByteArray>)[0][0].toInt()
+                    (raw - outputZeroPoint) * outputScale
+                }
+            }
+        }
+
+        private fun quantizeMel(mel: Array<Array<Array<FloatArray>>>): Array<Array<Array<ByteArray>>> =
+            Array(1) {
+                Array(N_MELS) { melBin ->
+                    Array(EXPECTED_FRAMES) { frame ->
+                        ByteArray(1) { quantize(mel[0][melBin][frame][0]) }
+                    }
+                }
+            }
+
+        private fun quantize(value: Float): Byte {
+            val scale = inputScale.takeIf { it > 0f } ?: 1f
+            val q = round(value / scale + inputZeroPoint)
+                .toInt()
+                .coerceIn(Byte.MIN_VALUE.toInt(), Byte.MAX_VALUE.toInt())
+            return q.toByte()
+        }
+
+        private fun loadModel(modelName: String): MappedByteBuffer {
+            val afd = context.assets.openFd(modelName)
+            FileInputStream(afd.fileDescriptor).use { input ->
+                return input.channel.map(
+                    FileChannel.MapMode.READ_ONLY,
+                    afd.startOffset,
+                    afd.declaredLength,
+                )
+            }
+        }
+
+        private fun validateInputShape(tensor: Tensor, assetName: String) {
+            val expected = intArrayOf(1, N_MELS, EXPECTED_FRAMES, 1)
+            val actual = tensor.shape()
+            require(actual.contentEquals(expected)) {
+                "$assetName input must be [1, 40, 97, 1], got ${actual.joinToString()}"
+            }
+        }
+    }
+
+    private enum class TensorType {
+        FLOAT32,
+        INT8;
+
+        companion object {
+            fun from(name: String): TensorType = when (name) {
+                "FLOAT32" -> FLOAT32
+                "INT8" -> INT8
+                else -> throw IllegalArgumentException("Unsupported tensor type: $name")
+            }
+        }
+    }
+
+    private object MelFeatureExtractor {
+        private val hann = FloatArray(N_FFT) { i ->
+            (0.5 - 0.5 * cos(2.0 * PI * i / (N_FFT - 1))).toFloat()
+        }
+        private val filters = buildMelFilters()
+        private val fftReal = FloatArray(N_FFT)
+        private val fftImag = FloatArray(N_FFT)
+
+        fun extract(audio: FloatArray): Array<Array<Array<FloatArray>>> {
+            val melPower = Array(N_MELS) { FloatArray(EXPECTED_FRAMES) }
+            val power = FloatArray(N_FFT / 2 + 1)
+
+            for (frame in 0 until EXPECTED_FRAMES) {
+                val offset = frame * HOP_LENGTH
+                computePowerSpectrum(audio, offset, power)
+                for (mel in 0 until N_MELS) {
+                    var sum = 0f
+                    val filter = filters[mel]
+                    for (bin in filter.indices) {
+                        sum += power[bin] * filter[bin]
+                    }
+                    melPower[mel][frame] = sum.coerceAtLeast(1e-10f)
+                }
+            }
+
+            var maxDb = -120f
+            val melDb = Array(N_MELS) { FloatArray(EXPECTED_FRAMES) }
+            for (mel in 0 until N_MELS) {
+                for (frame in 0 until EXPECTED_FRAMES) {
+                    val db = 10f * log10(melPower[mel][frame])
+                    melDb[mel][frame] = db
+                    if (db > maxDb) maxDb = db
+                }
+            }
+
+            var minValue = Float.MAX_VALUE
+            var maxValue = -Float.MAX_VALUE
+            for (mel in 0 until N_MELS) {
+                for (frame in 0 until EXPECTED_FRAMES) {
+                    val value = melDb[mel][frame] - maxDb
+                    melDb[mel][frame] = value
+                    minValue = minOf(minValue, value)
+                    maxValue = maxOf(maxValue, value)
+                }
+            }
+
+            val range = (maxValue - minValue).coerceAtLeast(1e-6f)
+            return Array(1) {
+                Array(N_MELS) { mel ->
+                    Array(EXPECTED_FRAMES) { frame ->
+                        FloatArray(1) { (melDb[mel][frame] - minValue) / range }
+                    }
+                }
+            }
+        }
+
+        private fun computePowerSpectrum(audio: FloatArray, offset: Int, out: FloatArray) {
+            for (i in 0 until N_FFT) {
+                fftReal[i] = audio[offset + i] * hann[i]
+                fftImag[i] = 0f
+            }
+            fft(fftReal, fftImag)
+            for (k in out.indices) {
+                val real = fftReal[k]
+                val imag = fftImag[k]
+                out[k] = (real * real + imag * imag) / N_FFT
+            }
+        }
+
+        private fun fft(real: FloatArray, imag: FloatArray) {
+            var j = 0
+            for (i in 1 until N_FFT) {
+                var bit = N_FFT shr 1
+                while (j and bit != 0) {
+                    j = j xor bit
+                    bit = bit shr 1
+                }
+                j = j xor bit
+                if (i < j) {
+                    val tempReal = real[i]
+                    real[i] = real[j]
+                    real[j] = tempReal
+                    val tempImag = imag[i]
+                    imag[i] = imag[j]
+                    imag[j] = tempImag
+                }
+            }
+
+            var len = 2
+            while (len <= N_FFT) {
+                val angle = -2.0 * PI / len
+                val wLenReal = cos(angle).toFloat()
+                val wLenImag = sin(angle).toFloat()
+                var i = 0
+                while (i < N_FFT) {
+                    var wReal = 1f
+                    var wImag = 0f
+                    for (k in 0 until len / 2) {
+                        val even = i + k
+                        val odd = even + len / 2
+                        val oddReal = real[odd] * wReal - imag[odd] * wImag
+                        val oddImag = real[odd] * wImag + imag[odd] * wReal
+
+                        real[odd] = real[even] - oddReal
+                        imag[odd] = imag[even] - oddImag
+                        real[even] += oddReal
+                        imag[even] += oddImag
+
+                        val nextReal = wReal * wLenReal - wImag * wLenImag
+                        wImag = wReal * wLenImag + wImag * wLenReal
+                        wReal = nextReal
+                    }
+                    i += len
+                }
+                len = len shl 1
+            }
+        }
+
+        private fun buildMelFilters(): Array<FloatArray> {
+            val melMin = hzToMel(FMIN)
+            val melMax = hzToMel(FMAX)
+            val melPoints = FloatArray(N_MELS + 2) { i ->
+                melMin + (melMax - melMin) * i / (N_MELS + 1)
+            }
+            val hzPoints = melPoints.map { melToHz(it) }
+            val binPoints = hzPoints.map {
+                (((N_FFT + 1) * it / SAMPLE_RATE).toInt()).coerceIn(0, N_FFT / 2)
+            }
+
+            return Array(N_MELS) { mel ->
+                val filter = FloatArray(N_FFT / 2 + 1)
+                val left = binPoints[mel]
+                val center = binPoints[mel + 1]
+                val right = binPoints[mel + 2]
+
+                for (bin in left until center) {
+                    filter[bin] = (bin - left).toFloat() / (center - left).coerceAtLeast(1)
+                }
+                for (bin in center until right) {
+                    filter[bin] = (right - bin).toFloat() / (right - center).coerceAtLeast(1)
+                }
+                filter
+            }
+        }
+
+        private fun hzToMel(hz: Float): Float =
+            (2595.0 * log10(1.0 + hz / 700.0)).toFloat()
+
+        private fun melToHz(mel: Float): Float =
+            (700.0 * (10.0.pow(mel / 2595.0) - 1.0)).toFloat()
+    }
+
+    companion object {
+        private const val TAG = "TFLiteWakeWord"
+        private const val SAMPLE_RATE = 16000
+        private const val WINDOW_SAMPLES = 16000
+        private const val READ_SAMPLES = 1600
+        private const val INFERENCE_STRIDE_SAMPLES = 8000
+        private const val N_MELS = 40
+        private const val N_FFT = 512
+        private const val HOP_LENGTH = 160
+        private const val EXPECTED_FRAMES = 97
+        private const val FMIN = 80f
+        private const val FMAX = 7600f
+        private const val STAGE1_THRESHOLD = 0.05f
+        private const val STAGE2_THRESHOLD = 0.20f
+        private const val DEBUG_TRIGGER_FROM_STAGE1 = true
+        private const val DEBUG_STAGE1_TRIGGER_THRESHOLD = 0.20f
+        private const val DETECTION_COOLDOWN_MS = 1500L
     }
 }

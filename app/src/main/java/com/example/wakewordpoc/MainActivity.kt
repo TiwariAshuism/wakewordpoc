@@ -5,6 +5,7 @@ import android.app.KeyguardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -48,14 +49,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.example.wakewordpoc.service.WakeWordService
 import com.example.wakewordpoc.ui.theme.WakewordpocTheme
 import kotlinx.coroutines.delay
+import java.io.File
 import java.text.DateFormat
 import java.util.Date
 
@@ -113,9 +113,10 @@ class MainActivity : ComponentActivity() {
 private fun HeyMScreen() {
     val context = LocalContext.current
     var status by remember { mutableStateOf(WakeWordConfig.snapshot(context)) }
-    var accessKey by remember { mutableStateOf(WakeWordConfig.accessKey(context)) }
     var keywordPath by remember { mutableStateOf(WakeWordConfig.keywordPath(context)) }
     var autoStart by remember { mutableStateOf(WakeWordConfig.autoStart(context)) }
+    var recordings by remember { mutableStateOf(recordingFiles(context)) }
+    var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
     var pendingAction by remember { mutableStateOf<(() -> Unit)?>(null) }
 
     val permissionsLauncher = rememberLauncherForActivityResult(
@@ -147,6 +148,8 @@ private fun HeyMScreen() {
 
         while (true) {
             status = WakeWordConfig.snapshot(context)
+            recordings = recordingFiles(context)
+            nowMs = System.currentTimeMillis()
             delay(1000L)
         }
     }
@@ -159,68 +162,18 @@ private fun HeyMScreen() {
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text(
-                text = "Hey M",
-                style = MaterialTheme.typography.headlineMedium,
-                fontWeight = FontWeight.SemiBold,
-            )
-            Text(
-                text = "Wake listener: ${status.engineLabel()}",
-                style = MaterialTheme.typography.titleMedium,
-            )
+            HubHeader(status = status, nowMs = nowMs)
 
-            ControlCard(title = "Runtime") {
-                StatusLine("Service", if (status.serviceRunning) "running" else "stopped")
-                StatusLine("Recorder", if (status.recording) "recording" else "idle")
+            ControlCard(title = "Assistant") {
+                StatusLine("Wake listener", status.engineLabel())
+                StatusLine("Detections", status.detectionCount.toString())
                 StatusLine("Last trigger", status.lastDetectionLabel())
-                StatusLine("Last file", status.lastFile.ifBlank { "none" })
-                if (status.lastError.isNotBlank()) {
-                    StatusLine("Last error", status.lastError)
+                StatusLine("Last confidence", status.lastConfidenceLabel())
+                if (status.recording) {
+                    StatusLine("Recording", status.recordingRemainingLabel(nowMs))
+                } else {
+                    StatusLine("Recording", "idle")
                 }
-            }
-
-            ControlCard(title = "Picovoice") {
-                OutlinedTextField(
-                    value = accessKey,
-                    onValueChange = { accessKey = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("AccessKey") },
-                    singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(
-                        capitalization = KeyboardCapitalization.None,
-                        keyboardType = KeyboardType.Password,
-                    ),
-                )
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = keywordPath,
-                    onValueChange = { keywordPath = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("Keyword asset/path") },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.None),
-                )
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(checked = autoStart, onCheckedChange = { autoStart = it })
-                    Text("Start after boot")
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = {
-                        WakeWordConfig.saveSettings(context, accessKey, keywordPath, autoStart)
-                        status = WakeWordConfig.snapshot(context)
-                    }) {
-                        Text("Save")
-                    }
-                    TextButton(onClick = {
-                        keywordPath = WakeWordConfig.DEFAULT_KEYWORD_ASSET
-                    }) {
-                        Text("Use asset")
-                    }
-                }
-            }
-
-            ControlCard(title = "Controls") {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -241,20 +194,91 @@ private fun HeyMScreen() {
                     }
                 }
                 Spacer(Modifier.height(8.dp))
-                Button(
+                Row(
                     modifier = Modifier.fillMaxWidth(),
-                    onClick = {
-                        runWithPermissions { simulateDetection(context) }
-                    },
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    Text("Simulate Wake")
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        onClick = { runWithPermissions { simulateDetection(context) } },
+                    ) {
+                        Text("Simulate")
+                    }
+                    Button(
+                        modifier = Modifier.weight(1f),
+                        enabled = status.recording,
+                        onClick = { stopRecording(context) },
+                    ) {
+                        Text("Stop Rec")
+                    }
                 }
-                Spacer(Modifier.height(8.dp))
-                TextButton(onClick = { openBatterySettings(context) }) {
-                    Text("Battery Settings")
+                if (status.lastError.isNotBlank()) {
+                    Spacer(Modifier.height(8.dp))
+                    StatusLine("Last error", status.lastError)
                 }
-                TextButton(onClick = { openHomeSettings(context) }) {
-                    Text("Home Settings")
+            }
+
+            ControlCard(title = "Recordings") {
+                if (recordings.isEmpty()) {
+                    Text("No recordings yet", style = MaterialTheme.typography.bodyMedium)
+                } else {
+                    recordings.take(6).forEach { file ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(file.name, style = MaterialTheme.typography.bodyMedium)
+                                Text(
+                                    file.recordingLabel(),
+                                    style = MaterialTheme.typography.labelMedium,
+                                )
+                            }
+                            Button(onClick = { playRecording(file) }) {
+                                Text("Play")
+                            }
+                        }
+                    }
+                }
+            }
+
+            ControlCard(title = "Wake Model") {
+                OutlinedTextField(
+                    value = keywordPath,
+                    onValueChange = { keywordPath = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Stage 2 model asset") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.None),
+                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = autoStart, onCheckedChange = { autoStart = it })
+                    Text("Start after boot")
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = {
+                        WakeWordConfig.saveSettings(context, "", keywordPath, autoStart)
+                        status = WakeWordConfig.snapshot(context)
+                    }) {
+                        Text("Save")
+                    }
+                    TextButton(onClick = {
+                        keywordPath = WakeWordConfig.DEFAULT_KEYWORD_ASSET
+                    }) {
+                        Text("Use asset")
+                    }
+                }
+            }
+
+            ControlCard(title = "Desk Setup") {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { openBatterySettings(context) }) {
+                        Text("Battery")
+                    }
+                    TextButton(onClick = { openHomeSettings(context) }) {
+                        Text("Home App")
+                    }
                 }
             }
 
@@ -290,6 +314,52 @@ private fun HeyMScreen() {
                     Text(status.rootResult, style = MaterialTheme.typography.bodySmall)
                 }
             }
+
+            ControlCard(title = "Diagnostics") {
+                StatusLine("ML status", status.lastMlStatus.ifBlank { "none" })
+                StatusLine("Audio windows", status.audioWindows.toString())
+                StatusLine("Stage 1 score", status.lastStage1Score.scoreLabel())
+                StatusLine("Stage 2 score", status.lastStage2Score.scoreLabel())
+                StatusLine("Last file", status.lastFile.ifBlank { "none" })
+            }
+        }
+    }
+}
+
+@Composable
+private fun HubHeader(status: WakeWordStatus, nowMs: Long) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = when {
+                status.recording -> MaterialTheme.colorScheme.errorContainer
+                status.engineActive -> MaterialTheme.colorScheme.primaryContainer
+                else -> MaterialTheme.colorScheme.surfaceVariant
+            },
+        ),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = "Hey M Hub",
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                text = status.hubStateLabel(nowMs),
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                text = if (status.lastDetection > 0L) {
+                    "Last wake ${status.lastDetectionLabel()} · ${status.lastConfidenceLabel()}"
+                } else {
+                    "Ready for first wake"
+                },
+                style = MaterialTheme.typography.bodyMedium,
+            )
         }
     }
 }
@@ -324,7 +394,6 @@ private fun StatusLine(label: String, value: String) {
 private fun WakeWordStatus.engineLabel(): String = when {
     recording -> "recording"
     engineActive -> "active"
-    serviceRunning && !accessKeySet -> "waiting for AccessKey"
     serviceRunning -> "service ready"
     else -> "off"
 }
@@ -333,6 +402,26 @@ private fun WakeWordStatus.lastDetectionLabel(): String {
     if (lastDetection <= 0L) return "none"
     return DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.MEDIUM)
         .format(Date(lastDetection))
+}
+
+private fun WakeWordStatus.lastConfidenceLabel(): String {
+    if (lastDetection <= 0L) return "none"
+    return "${(lastConfidence * 100f).toInt().coerceIn(0, 100)}%"
+}
+
+private fun Float.scoreLabel(): String = "%.3f".format(this)
+
+private fun WakeWordStatus.hubStateLabel(nowMs: Long): String = when {
+    recording -> "Recording · ${recordingRemainingLabel(nowMs)}"
+    engineActive -> "Listening for Hey M"
+    serviceRunning -> "Starting listener"
+    else -> "Stopped"
+}
+
+private fun WakeWordStatus.recordingRemainingLabel(nowMs: Long): String {
+    val elapsed = ((nowMs - recordingStarted).coerceAtLeast(0L) / 1000L).toInt()
+    val remaining = (WakeWordConfig.RECORD_SECONDS - elapsed).coerceAtLeast(0)
+    return "${remaining}s left"
 }
 
 private fun requestPermissions(
@@ -372,6 +461,13 @@ private fun stopWakeService(context: Context) {
     )
 }
 
+private fun stopRecording(context: Context) {
+    context.startService(
+        Intent(context, WakeWordService::class.java)
+            .setAction(WakeWordService.ACTION_STOP_RECORDING),
+    )
+}
+
 private fun simulateDetection(context: Context) {
     ContextCompat.startForegroundService(
         context,
@@ -396,6 +492,35 @@ private fun openHomeSettings(context: Context) {
         context.startActivity(Intent(Settings.ACTION_HOME_SETTINGS))
     }.onFailure {
         context.startActivity(Intent(Settings.ACTION_SETTINGS))
+    }
+}
+
+private fun recordingFiles(context: Context): List<File> {
+    val directory = File(context.getExternalFilesDir(null), "wake-recordings")
+    return directory.listFiles { file -> file.isFile && file.extension == "m4a" }
+        ?.sortedByDescending { it.lastModified() }
+        .orEmpty()
+}
+
+private fun File.recordingLabel(): String {
+    val date = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
+        .format(Date(lastModified()))
+    val kb = (length() / 1024L).coerceAtLeast(1L)
+    return "$date · ${kb} KB"
+}
+
+private fun playRecording(file: File) {
+    runCatching {
+        MediaPlayer().apply {
+            setDataSource(file.absolutePath)
+            setOnCompletionListener { player -> player.release() }
+            setOnErrorListener { player, _, _ ->
+                player.release()
+                true
+            }
+            prepare()
+            start()
+        }
     }
 }
 

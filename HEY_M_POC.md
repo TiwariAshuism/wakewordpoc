@@ -3,27 +3,37 @@
 This Android app is wired as a tablet-first proof of concept:
 
 - Foreground microphone service with a persistent notification.
-- Porcupine custom wake word listener.
+- Two-stage TensorFlow Lite wake word cascade.
 - Boot receiver for restart after reboot/package update.
 - Screen wake and activity launch when the wake word fires.
+- Stage 1 model: `stage1_fp16.tflite`
+- Stage 2 verifier: `stage2_fp16.tflite`
 - Two-minute AAC recording saved directly with `MediaRecorder` in the app's
   external files directory.
 - Manual `Simulate Wake` control to test the recording/screen flow before the model is ready.
 - Optional root buttons for stay-awake behavior on a controlled tablet.
 
-## Porcupine Setup
+## Model Setup
 
-1. Create a Picovoice AccessKey in the Picovoice Console.
-2. Train/download the Android custom wake word model for `Hey M`.
-3. Place the `.ppn` file at:
+Place the trained TFLite files at:
 
 ```text
-app/src/main/assets/hey_m_android.ppn
+app/src/main/assets/stage1_fp16.tflite
+app/src/main/assets/stage2_fp16.tflite
 ```
 
-4. Install the debug APK, open the app, paste the AccessKey, keep the keyword field as `hey_m_android.ppn`, and tap `Save`.
+The Android detector uses both files:
 
-The app uses `ai.picovoice:porcupine-android:4.0.0`.
+```text
+AudioRecord 16 kHz PCM
+  -> mel spectrogram [1, 40, 97, 1]
+  -> Stage 1 broad detector
+  -> Stage 2 verifier
+  -> wake screen + 2-minute recording
+```
+
+ONNX files are useful for desktop validation/export comparison. Android currently uses
+TensorFlow Lite because it is the native mobile runtime path.
 
 ## Tablet Setup
 
